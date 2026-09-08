@@ -19,12 +19,9 @@ import {
 export function App() {
   const [activeTab, setActiveTab] = useState<string>("builder");
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
-
-  // File uploads
   const [audioFiles, setAudioFiles] = useState<AudioFileItem[]>([]);
   const [transcriptFiles, setTranscriptFiles] = useState<TranscriptFileItem[]>([]);
 
-  // Build Options
   const [options, setOptions] = useState<BuildOptions>({
     sampleRate: 24000,
     paddingBefore: 0.15,
@@ -40,7 +37,6 @@ export function App() {
     outputDir: "output_dataset",
   });
 
-  // Build Progress
   const [progress, setProgress] = useState<BuildProgressState>({
     isBuilding: false,
     current: 0,
@@ -54,90 +50,89 @@ export function App() {
     recentLogs: [],
   });
 
-  // Dataset items
   const [samples, setSamples] = useState<DatasetSample[]>([]);
   const [rejected, setRejected] = useState<RejectedSample[]>([]);
   const [report, setReport] = useState<DatasetReport | null>(null);
 
-  // Fetch system status
   useEffect(() => {
     fetch("/api/system-status")
-      .then((res) => res.json())
-      .then((data) => setSystemStatus(data))
+      .then(async (res) => {
+        if (!res.ok) throw new Error(await res.text());
+        return res.json();
+      })
+      .then(setSystemStatus)
       .catch((err) => console.error("Error fetching system status:", err));
   }, []);
 
-  // Fetch dataset records
   const fetchDataset = useCallback(async (dir?: string) => {
     const targetDir = dir || options.outputDir;
     try {
       const res = await fetch(`/api/dataset?outputDir=${encodeURIComponent(targetDir)}`);
       const data = await res.json();
-      if (data.exists) {
-        setSamples(data.samples || []);
-        setRejected(data.rejected || []);
-        if (data.report) setReport(data.report);
-      } else {
-        // Check sample_output fallback if default output is empty
-        const fallbackRes = await fetch("/api/dataset?outputDir=sample_output");
-        const fallbackData = await fallbackRes.json();
-        if (fallbackData.exists && fallbackData.samples?.length > 0) {
-          setSamples(fallbackData.samples || []);
-          setRejected(fallbackData.rejected || []);
-          if (fallbackData.report) setReport(fallbackData.report);
-        }
+      if (!res.ok || !data.exists) {
+        setSamples([]);
+        setRejected([]);
+        setReport(null);
+        return;
       }
+      setSamples(Array.isArray(data.samples) ? data.samples : []);
+      setRejected(Array.isArray(data.rejected) ? data.rejected : []);
+      setReport(data.report || null);
     } catch (err) {
       console.error("Error loading dataset:", err);
+      setSamples([]);
+      setRejected([]);
+      setReport(null);
     }
   }, [options.outputDir]);
 
-  useEffect(() => {
-    fetchDataset();
-  }, [fetchDataset]);
+  useEffect(() => { fetchDataset(); }, [fetchDataset]);
 
-  // Polling for build progress
   useEffect(() => {
-    let timer: any;
-    if (progress.isBuilding) {
-      timer = setInterval(async () => {
-        try {
-          const res = await fetch("/api/progress");
-          const data: BuildProgressState = await res.json();
-          setProgress(data);
-
-          if (!data.isBuilding && data.report) {
-            setReport(data.report);
-            fetchDataset();
-          }
-        } catch (e) {
-          console.error("Progress polling error:", e);
+    if (!progress.isBuilding) return;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch("/api/progress");
+        const data: BuildProgressState = await res.json();
+        setProgress(data);
+        if (!data.isBuilding) {
+          if (data.report) setReport(data.report);
+          await fetchDataset(options.outputDir);
         }
-      }, 1000);
-    }
+      } catch (e) {
+        console.error("Progress polling error:", e);
+      }
+    }, 1000);
     return () => clearInterval(timer);
-  }, [progress.isBuilding, fetchDataset]);
+  }, [progress.isBuilding, fetchDataset, options.outputDir]);
 
-  // Load sample dataset
   const handleLoadSample = async () => {
     try {
       const res = await fetch("/api/load-sample", { method: "POST" });
       const data = await res.json();
-      if (data.success) {
-        setAudioFiles(data.audioFiles);
-        setTranscriptFiles(data.transcriptFiles);
-      } else {
-        alert(data.error || "Không thể tải dữ liệu mẫu.");
-      }
+      if (!res.ok || !data.success) throw new Error(data.error || "Không thể tải dữ liệu mẫu.");
+      setAudioFiles(data.audioFiles || []);
+      setTranscriptFiles(data.transcriptFiles || []);
     } catch (e: any) {
       alert("Lỗi tải mẫu: " + e.message);
     }
   };
 
-  // Start build process
   const handleStartBuild = async () => {
-    if (audioFiles.length === 0 || transcriptFiles.length === 0) {
-      alert("Vui lòng tải lên hoặc chọn ít nhất 1 file audio và 1 file transcript!");
+    if (!audioFiles.length || !transcriptFiles.length) {
+      alert("Vui lòng chọn audio và transcript.");
+      return;
+    }
+    if (audioFiles.length !== transcriptFiles.length) {
+      alert(`Cần đúng 1 transcript cho mỗi audio. Hiện có ${audioFiles.length} audio và ${transcriptFiles.length} transcript.`);
+      return;
+    }
+    if (options.minDuration >= options.maxDuration) {
+      alert("Min Duration phải nhỏ hơn Max Duration.");
+      return;
+    }
+    if (options.peakNorm && options.loudnessNorm) {
+      alert("Chỉ bật một kiểu normalization: Peak hoặc Loudness.");
       return;
     }
 
@@ -152,18 +147,20 @@ export function App() {
         }),
       });
       const data = await res.json();
-      if (data.success) {
-        setProgress((prev) => ({
-          ...prev,
-          isBuilding: true,
-          percentage: 0,
-          message: "Bắt đầu tiến trình xử lý audio...",
-        }));
-      } else {
-        alert(data.error || "Lỗi khi bắt đầu build.");
-      }
+      if (!res.ok || !data.success) throw new Error(data.error || "Lỗi khi bắt đầu build.");
+      setSamples([]);
+      setRejected([]);
+      setReport(null);
+      setProgress((prev) => ({
+        ...prev,
+        isBuilding: true,
+        percentage: 0,
+        error: null,
+        report: null,
+        message: "Bắt đầu tiến trình xử lý audio...",
+      }));
     } catch (e: any) {
-      alert("Lỗi kết nối: " + e.message);
+      alert("Không thể bắt đầu build: " + e.message);
     }
   };
 
@@ -192,7 +189,6 @@ export function App() {
             report={report}
           />
         )}
-
         {activeTab === "preview" && (
           <PreviewTab
             samples={samples}
@@ -201,20 +197,13 @@ export function App() {
             onRefresh={() => fetchDataset(options.outputDir)}
           />
         )}
-
-        {activeTab === "validator" && (
-          <ValidatorTab outputDir={options.outputDir} />
-        )}
-
-        {activeTab === "export" && (
-          <ExportTab outputDir={options.outputDir} />
-        )}
-
+        {activeTab === "validator" && <ValidatorTab outputDir={options.outputDir} />}
+        {activeTab === "export" && <ExportTab outputDir={options.outputDir} />}
         {activeTab === "logs" && <LogsTab />}
       </main>
 
       <footer className="border-t border-slate-900 bg-slate-950/80 py-4 text-center text-xs text-slate-500">
-        Vietnamese TTS Dataset Builder &bull; Python 3.11 &bull; FFmpeg &bull; Chuẩn LJSpeech &bull; Sẵn sàng cho VITS, XTTS v2, F5-TTS, StyleTTS 2
+        Vietnamese TTS Dataset Builder &bull; Python 3.11 &bull; FFmpeg &bull; LJSpeech-style metadata &bull; Dataset preparation only
       </footer>
     </div>
   );
