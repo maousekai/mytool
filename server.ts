@@ -1,7 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { spawn, execSync } from "child_process";
+import { spawn, spawnSync, execFileSync, execSync } from "child_process";
 import multer from "multer";
 import { createServer as createViteServer } from "vite";
 
@@ -10,6 +10,53 @@ const PORT = 3000;
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+interface PythonInvocation {
+  command: string;
+  prefixArgs: string[];
+  version: string;
+}
+
+function resolvePython(): PythonInvocation | null {
+  const candidates: Array<{ command: string; prefixArgs: string[] }> = [
+    { command: "python3", prefixArgs: [] },
+    { command: "python", prefixArgs: [] },
+    { command: "py", prefixArgs: ["-3"] },
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      const result = spawnSync(
+        candidate.command,
+        [...candidate.prefixArgs, "--version"],
+        { encoding: "utf-8", timeout: 3000, shell: false }
+      );
+      if (result.status === 0) {
+        const version = `${result.stdout || ""}${result.stderr || ""}`.trim();
+        return { ...candidate, version };
+      }
+    } catch {
+      // Try the next launcher.
+    }
+  }
+  return null;
+}
+
+function runPythonSync(args: string[], timeout = 15000): string {
+  const python = resolvePython();
+  if (!python) {
+    throw new Error("Không tìm thấy Python 3. Hãy cài Python 3.10/3.11 và thêm vào PATH.");
+  }
+  return execFileSync(
+    python.command,
+    [...python.prefixArgs, ...args],
+    { encoding: "utf-8", timeout, cwd: process.cwd(), windowsHide: true }
+  );
+}
+
+function resolveOutputDir(outputDir: string): string {
+  return path.isAbsolute(outputDir) ? path.normalize(outputDir) : path.join(process.cwd(), outputDir);
+}
 
 // Storage for uploaded files
 const uploadDir = path.join(process.cwd(), "uploads");
@@ -29,10 +76,9 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB limit
+  limits: { fileSize: 500 * 1024 * 1024 },
 });
 
-// State for active build job
 interface BuildProgress {
   isBuilding: boolean;
   current: number;
@@ -59,7 +105,6 @@ let activeBuildState: BuildProgress = {
   recentLogs: [],
 };
 
-// 1. System status check
 app.get("/api/system-status", (_req, res) => {
   let ffmpegOk = false;
   let ffmpegVersion = "";
@@ -67,30 +112,23 @@ app.get("/api/system-status", (_req, res) => {
     const out = execSync("ffmpeg -version", { encoding: "utf-8", timeout: 3000 });
     ffmpegOk = true;
     ffmpegVersion = out.split("\n")[0];
-  } catch (e: any) {
+  } catch {
     ffmpegVersion = "Chưa cài đặt hoặc không tìm thấy";
   }
 
-  let pythonVersion = "";
-  try {
-    const out = execSync("python3 --version", { encoding: "utf-8", timeout: 3000 });
-    pythonVersion = out.trim();
-  } catch (e: any) {
-    pythonVersion = "Không tìm thấy python3";
-  }
-
+  const python = resolvePython();
   const sampleAvailable = fs.existsSync(path.join(process.cwd(), "sample_data", "audiobook_chapter_01.mp3"));
 
   res.json({
     ffmpegOk,
     ffmpegVersion,
-    pythonVersion,
+    pythonVersion: python?.version || "Không tìm thấy Python 3",
+    pythonCommand: python ? [python.command, ...python.prefixArgs].join(" ") : null,
     sampleAvailable,
     defaultOutputDir: "output_dataset",
   });
 });
 
-// 2. Upload audio files & transcripts
 app.post(
   "/api/upload",
   upload.fields([
@@ -111,18 +149,13 @@ app.post(
         sizeKb: (f.size / 1024).toFixed(1),
       }));
 
-      res.json({
-        success: true,
-        audioFiles,
-        transcriptFiles,
-      });
+      res.json({ success: true, audioFiles, transcriptFiles });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
   }
 );
 
-// 3. Load sample dataset
 app.post("/api/load-sample", (_req, res) => {
   const sampleAudio = path.join(process.cwd(), "sample_data", "audiobook_chapter_01.mp3");
   const sampleTranscript = path.join(process.cwd(), "sample_data", "transcript.json");
@@ -134,24 +167,19 @@ app.post("/api/load-sample", (_req, res) => {
 
   res.json({
     success: true,
-    audioFiles: [
-      {
-        originalName: "audiobook_chapter_01.mp3",
-        path: sampleAudio,
-        sizeMb: (fs.statSync(sampleAudio).size / (1024 * 1024)).toFixed(2),
-      },
-    ],
-    transcriptFiles: [
-      {
-        originalName: "transcript.json",
-        path: sampleTranscript,
-        sizeKb: (fs.statSync(sampleTranscript).size / 1024).toFixed(1),
-      },
-    ],
+    audioFiles: [{
+      originalName: "audiobook_chapter_01.mp3",
+      path: sampleAudio,
+      sizeMb: (fs.statSync(sampleAudio).size / (1024 * 1024)).toFixed(2),
+    }],
+    transcriptFiles: [{
+      originalName: "transcript.json",
+      path: sampleTranscript,
+      sizeKb: (fs.statSync(sampleTranscript).size / 1024).toFixed(1),
+    }],
   });
 });
 
-// 4. Start build dataset process
 app.post("/api/build", (req, res) => {
   if (activeBuildState.isBuilding) {
     res.status(400).json({ error: "Một tiến trình build đang chạy. Vui lòng chờ hoàn thành!" });
@@ -180,6 +208,12 @@ app.post("/api/build", (req, res) => {
     return;
   }
 
+  const python = resolvePython();
+  if (!python) {
+    res.status(500).json({ error: "Không tìm thấy Python 3 trên hệ thống." });
+    return;
+  }
+
   activeBuildState = {
     isBuilding: true,
     current: 0,
@@ -190,32 +224,22 @@ app.post("/api/build", (req, res) => {
     message: "Khởi tạo tiến trình Python...",
     error: null,
     report: null,
-    recentLogs: ["Bắt đầu tiến trình tạo dataset TTS..."],
+    recentLogs: [`Bắt đầu tiến trình tạo dataset TTS bằng ${python.command}.`],
   };
 
   const args = [
     path.join(process.cwd(), "tools", "run_dataset_cli.py"),
     "build",
-    "--output-dir",
-    outputDir,
-    "--audio-files",
-    audioFiles.join(","),
-    "--transcript-files",
-    transcriptFiles.join(","),
-    "--sample-rate",
-    String(sampleRate),
-    "--padding-before",
-    String(paddingBefore),
-    "--padding-after",
-    String(paddingAfter),
-    "--min-duration",
-    String(minDuration),
-    "--max-duration",
-    String(maxDuration),
-    "--merge-silence-threshold",
-    String(mergeSilenceThreshold),
-    "--target-lufs",
-    String(targetLufs),
+    "--output-dir", outputDir,
+    "--audio-files", audioFiles.join(","),
+    "--transcript-files", transcriptFiles.join(","),
+    "--sample-rate", String(sampleRate),
+    "--padding-before", String(paddingBefore),
+    "--padding-after", String(paddingAfter),
+    "--min-duration", String(minDuration),
+    "--max-duration", String(maxDuration),
+    "--merge-silence-threshold", String(mergeSilenceThreshold),
+    "--target-lufs", String(targetLufs),
   ];
 
   if (refineVad) args.push("--refine-vad");
@@ -223,7 +247,11 @@ app.post("/api/build", (req, res) => {
   if (peakNorm) args.push("--peak-norm");
   if (loudnessNorm) args.push("--loudness-norm");
 
-  const pyProcess = spawn("python3", args, { cwd: process.cwd() });
+  const pyProcess = spawn(
+    python.command,
+    [...python.prefixArgs, ...args],
+    { cwd: process.cwd(), shell: false, windowsHide: true }
+  );
 
   pyProcess.stdout.on("data", (data: Buffer) => {
     const lines = data.toString().split("\n");
@@ -239,9 +267,7 @@ app.post("/api/build", (req, res) => {
           activeBuildState.currentFile = event.current_file;
           activeBuildState.message = event.message;
           activeBuildState.recentLogs.push(`[${event.percentage}%] ${event.message}`);
-          if (activeBuildState.recentLogs.length > 50) {
-            activeBuildState.recentLogs.shift();
-          }
+          if (activeBuildState.recentLogs.length > 50) activeBuildState.recentLogs.shift();
         } else if (event.type === "completed") {
           activeBuildState.report = event.report;
           activeBuildState.percentage = 100;
@@ -256,9 +282,13 @@ app.post("/api/build", (req, res) => {
 
   pyProcess.stderr.on("data", (data: Buffer) => {
     const text = data.toString().trim();
-    if (text) {
-      activeBuildState.recentLogs.push(`[STDERR] ${text}`);
-    }
+    if (text) activeBuildState.recentLogs.push(`[STDERR] ${text}`);
+  });
+
+  pyProcess.on("error", (err) => {
+    activeBuildState.isBuilding = false;
+    activeBuildState.error = err.message;
+    activeBuildState.message = "Không thể khởi động tiến trình Python.";
   });
 
   pyProcess.on("close", (code) => {
@@ -272,15 +302,13 @@ app.post("/api/build", (req, res) => {
   res.json({ success: true, message: "Tiến trình build đã được khởi động." });
 });
 
-// 5. Get build progress
 app.get("/api/progress", (_req, res) => {
   res.json(activeBuildState);
 });
 
-// 6. Get dataset records & report
 app.get("/api/dataset", (req, res) => {
   const outputDir = (req.query.outputDir as string) || "output_dataset";
-  const absOutputDir = path.isAbsolute(outputDir) ? outputDir : path.join(process.cwd(), outputDir);
+  const absOutputDir = resolveOutputDir(outputDir);
 
   const reportPath = path.join(absOutputDir, "dataset_report.json");
   const metadataJsonPath = path.join(absOutputDir, "metadata.json");
@@ -288,16 +316,12 @@ app.get("/api/dataset", (req, res) => {
 
   let report = null;
   if (fs.existsSync(reportPath)) {
-    try {
-      report = JSON.parse(fs.readFileSync(reportPath, "utf-8"));
-    } catch {}
+    try { report = JSON.parse(fs.readFileSync(reportPath, "utf-8")); } catch {}
   }
 
   let samples: any[] = [];
   if (fs.existsSync(metadataJsonPath)) {
-    try {
-      samples = JSON.parse(fs.readFileSync(metadataJsonPath, "utf-8"));
-    } catch {}
+    try { samples = JSON.parse(fs.readFileSync(metadataJsonPath, "utf-8")); } catch {}
   }
 
   let rejected: any[] = [];
@@ -309,55 +333,31 @@ app.get("/api/dataset", (req, res) => {
         for (let i = 1; i < lines.length; i++) {
           const parts = lines[i].split(",");
           if (parts.length >= 6) {
-            rejected.push({
-              filename: parts[0],
-              text: parts[1],
-              reason: parts[2],
-              start: parts[3],
-              end: parts[4],
-              duration: parts[5],
-            });
+            rejected.push({ filename: parts[0], text: parts[1], reason: parts[2], start: parts[3], end: parts[4], duration: parts[5] });
           }
         }
       }
     } catch {}
   }
 
-  res.json({
-    exists: fs.existsSync(absOutputDir),
-    outputDir,
-    report,
-    samples,
-    rejected,
-  });
+  res.json({ exists: fs.existsSync(absOutputDir), outputDir, report, samples, rejected });
 });
 
-// 7. Stream individual WAV audio
 app.get("/api/audio/:filename", (req, res) => {
-  const { filename } = req.params;
+  const filename = path.basename(req.params.filename);
   const outputDir = (req.query.outputDir as string) || "output_dataset";
-  const wavPath = path.join(process.cwd(), outputDir, "wavs", filename);
+  const absOutputDir = resolveOutputDir(outputDir);
+  const wavPath = path.join(absOutputDir, "wavs", filename);
 
-  // Fallback check sample_output
-  let resolvedPath = wavPath;
-  if (!fs.existsSync(resolvedPath)) {
-    const fallback = path.join(process.cwd(), "sample_output", "wavs", filename);
-    if (fs.existsSync(fallback)) {
-      resolvedPath = fallback;
-    }
-  }
-
-  if (!fs.existsSync(resolvedPath)) {
-    res.status(404).send("Audio sample not found");
+  if (!fs.existsSync(wavPath)) {
+    res.status(404).send("Audio sample not found in the selected dataset");
     return;
   }
 
   res.setHeader("Content-Type", "audio/wav");
-  const stream = fs.createReadStream(resolvedPath);
-  stream.pipe(res);
+  fs.createReadStream(wavPath).pipe(res);
 });
 
-// 8. Regenerate single sample
 app.post("/api/regenerate", (req, res) => {
   const { outputDir = "output_dataset", filename, text, start, end } = req.body;
   if (!filename || text === undefined || start === undefined || end === undefined) {
@@ -368,23 +368,15 @@ app.post("/api/regenerate", (req, res) => {
   const args = [
     path.join(process.cwd(), "tools", "run_dataset_cli.py"),
     "regenerate",
-    "--output-dir",
-    outputDir,
-    "--filename",
-    filename,
-    "--text",
-    text,
-    "--start",
-    String(start),
-    "--end",
-    String(end),
+    "--output-dir", outputDir,
+    "--filename", path.basename(filename),
+    "--text", String(text),
+    "--start", String(start),
+    "--end", String(end),
   ];
 
   try {
-    const out = execSync(`python3 ${args.map((a) => `"${a}"`).join(" ")}`, {
-      encoding: "utf-8",
-      timeout: 10000,
-    });
+    const out = runPythonSync(args, 10000);
     const parsed = JSON.parse(out.trim().split("\n").pop() || "{}");
     res.json({ success: true, sample: parsed.sample });
   } catch (e: any) {
@@ -392,28 +384,19 @@ app.post("/api/regenerate", (req, res) => {
   }
 });
 
-// 9. Validate dataset
 app.post("/api/validate", (req, res) => {
   const { outputDir = "output_dataset", sampleRate = 24000, minDuration = 2.0, maxDuration = 12.0 } = req.body;
-
   const args = [
     path.join(process.cwd(), "tools", "run_dataset_cli.py"),
     "validate",
-    "--output-dir",
-    outputDir,
-    "--sample-rate",
-    String(sampleRate),
-    "--min-duration",
-    String(minDuration),
-    "--max-duration",
-    String(maxDuration),
+    "--output-dir", outputDir,
+    "--sample-rate", String(sampleRate),
+    "--min-duration", String(minDuration),
+    "--max-duration", String(maxDuration),
   ];
 
   try {
-    const out = execSync(`python3 ${args.map((a) => `"${a}"`).join(" ")}`, {
-      encoding: "utf-8",
-      timeout: 15000,
-    });
+    const out = runPythonSync(args, 15000);
     const parsed = JSON.parse(out.trim().split("\n").pop() || "{}");
     res.json(parsed.result);
   } catch (e: any) {
@@ -421,34 +404,49 @@ app.post("/api/validate", (req, res) => {
   }
 });
 
-// 10. Export Dataset ZIP
 app.get("/api/export-dataset", (req, res) => {
   const outputDir = (req.query.outputDir as string) || "output_dataset";
-  const absOutputDir = path.isAbsolute(outputDir) ? outputDir : path.join(process.cwd(), outputDir);
-
+  const absOutputDir = resolveOutputDir(outputDir);
   const zipTarget = path.join(absOutputDir, "dataset.zip");
+
   try {
-    execSync(`python3 tools/run_dataset_cli.py export --output-dir "${absOutputDir}"`, {
-      timeout: 15000,
+    if (!fs.existsSync(absOutputDir)) {
+      res.status(404).json({ error: `Dataset directory not found: ${absOutputDir}` });
+      return;
+    }
+
+    runPythonSync([
+      path.join(process.cwd(), "tools", "run_dataset_cli.py"),
+      "export",
+      "--output-dir", absOutputDir,
+    ], 120000);
+
+    if (!fs.existsSync(zipTarget)) {
+      res.status(500).json({ error: "Exporter completed but dataset.zip was not created." });
+      return;
+    }
+
+    const fd = fs.openSync(zipTarget, "r");
+    const magic = Buffer.alloc(4);
+    fs.readSync(fd, magic, 0, 4, 0);
+    fs.closeSync(fd);
+    if (!magic.equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) {
+      res.status(500).json({ error: "Generated file failed ZIP signature validation." });
+      return;
+    }
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", 'attachment; filename="dataset.zip"');
+    res.download(zipTarget, "dataset.zip", (err) => {
+      if (err && !res.headersSent) {
+        res.status(500).json({ error: err.message });
+      }
     });
-    if (fs.existsSync(zipTarget)) {
-      res.download(zipTarget, "dataset.zip");
-      return;
-    }
   } catch (e: any) {
-    // If output dir doesn't exist, check sample_output
-    const sampleZip = path.join(process.cwd(), "sample_output", "dataset.zip");
-    if (fs.existsSync(sampleZip)) {
-      res.download(sampleZip, "dataset.zip");
-      return;
-    }
     res.status(500).json({ error: e.message });
-    return;
   }
-  res.status(404).send("Dataset zip not found");
 });
 
-// 11. Export Standalone Python package (for Windows Local)
 app.get("/api/export-python-pkg", (_req, res) => {
   const pkgPath = path.join(process.cwd(), "public", "tts_dataset_builder.zip");
   if (fs.existsSync(pkgPath)) {
@@ -458,7 +456,6 @@ app.get("/api/export-python-pkg", (_req, res) => {
   res.status(404).send("Python package archive not found");
 });
 
-// 12. Read recent logs
 app.get("/api/logs", (_req, res) => {
   const logPath = path.join(process.cwd(), "logs", "app.log");
   if (!fs.existsSync(logPath)) {
@@ -474,13 +471,9 @@ app.get("/api/logs", (_req, res) => {
   }
 });
 
-// Setup Vite middleware in dev, static files in prod
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: "spa" });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
