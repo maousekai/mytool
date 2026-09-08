@@ -1,23 +1,39 @@
 """
 Vietnamese TTS Dataset Builder - Main Application Entrypoint.
 Launch local Gradio UI: python app.py -> http://127.0.0.1:7860
+
+The bootstrap below deliberately supports both:
+- python app.py (standalone Windows package)
+- python -m tts_dataset_builder.app (repository/package mode)
 """
 
 import os
 import sys
+import types
 import gradio as gr
 
-# Ensure root directory is on Python path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-from utils.logger import setup_logger, get_logger
-from utils.ffmpeg import check_ffmpeg
-from dataset.exporter import export_dataset_to_zip
-from ui.dataset_page import create_dataset_page
-from ui.preview import create_preview_page
-from ui.validator_page import create_validator_page
+# When app.py is executed directly, Python does not give it a package context.
+# Create a lightweight package context so all internal relative imports remain valid,
+# regardless of the name of the folder the user extracted the ZIP into.
+if __package__ in (None, ""):
+    package_name = "tts_dataset_builder"
+    package = sys.modules.get(package_name)
+    if package is None:
+        package = types.ModuleType(package_name)
+        package.__path__ = [APP_DIR]
+        package.__file__ = os.path.join(APP_DIR, "__init__.py")
+        sys.modules[package_name] = package
+    __package__ = package_name
 
-# Setup logging
+from .utils.logger import setup_logger, get_logger
+from .utils.ffmpeg import check_ffmpeg
+from .dataset.exporter import export_dataset_to_zip
+from .ui.dataset_page import create_dataset_page
+from .ui.preview import create_preview_page
+from .ui.validator_page import create_validator_page
+
 setup_logger(log_dir="logs", log_filename="app.log")
 logger = get_logger()
 
@@ -28,7 +44,6 @@ def main():
 
     builder_state = {"builder": None}
 
-    # Custom Gradio Blocks interface
     with gr.Blocks(
         title="Vietnamese TTS Dataset Builder",
         theme=gr.themes.Soft(
@@ -63,20 +78,30 @@ def main():
                 with gr.Row():
                     with gr.Column():
                         gr.Markdown("### 📦 Xuất Dataset thành file ZIP")
-                        gr.Markdown("Đóng gói toàn bộ thư mục `wavs/`, `metadata.csv`, `metadata.json`, `rejected.csv`, `dataset_report.json` thành `dataset.zip`.")
+                        gr.Markdown(
+                            "Đóng gói và kiểm tra toàn bộ `wavs/`, `metadata.csv`, "
+                            "`metadata.json`, `rejected.csv`, `dataset_report.json` thành `dataset.zip`."
+                        )
                         export_dir_in = gr.Textbox(label="Thư mục Dataset cần nén", value="output_dataset")
-                        export_btn = gr.Button("🎁 NÉN VÀ TẢI VỀ DATASET.ZIP", variant="primary")
-                        export_file_out = gr.File(label="File ZIP tải về")
+                        export_btn = gr.Button("🎁 NÉN, KIỂM TRA VÀ TẢI DATASET.ZIP", variant="primary")
+                        export_file_out = gr.File(label="File ZIP đã kiểm tra")
+                        export_status = gr.Textbox(label="Trạng thái ZIP", interactive=False)
 
                         def on_export(d_dir):
                             try:
                                 zip_p = export_dataset_to_zip(d_dir)
-                                return zip_p
+                                size_mb = os.path.getsize(zip_p) / (1024 * 1024)
+                                return zip_p, f"✅ VALID ZIP — {size_mb:.2f} MB — đã kiểm tra CRC/signature và số WAV"
                             except Exception as e:
+                                logger.exception("Dataset ZIP export failed")
                                 gr.Warning(f"Lỗi nén ZIP: {str(e)}")
-                                return None
+                                return None, f"❌ Export thất bại: {str(e)}"
 
-                        export_btn.click(fn=on_export, inputs=[export_dir_in], outputs=[export_file_out])
+                        export_btn.click(
+                            fn=on_export,
+                            inputs=[export_dir_in],
+                            outputs=[export_file_out, export_status],
+                        )
 
                     with gr.Column():
                         gr.Markdown("### 📜 Nhật ký xử lý (logs/app.log)")
