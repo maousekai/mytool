@@ -43,6 +43,9 @@ export interface DatasetSample {
   wav_filename: string;
   text: string;
   source_audio?: string;
+  source_key?: string;
+  source_pcm?: string;
+  sample_rate?: number;
   start_time: number;
   end_time: number;
   actual_start: number;
@@ -88,37 +91,52 @@ export interface ValidationSampleItem {
   text: string;
   duration: number;
   sample_rate?: number;
+  sample_width_bits?: number;
   peak_db?: number;
   rms_db?: number;
   quality_score: number;
-  status: "PERFECT" | "GOOD" | "WARNING" | "CRITICAL" | "ERROR";
+  status: "PASS" | "WARNING" | "REJECT";
   issues: string[];
+  errors?: string[];
+  warnings?: string[];
 }
 
 export interface ValidationSummary {
   total_checked: number;
   average_quality_score: number;
+  pass_samples: number;
+  warning_samples: number;
+  reject_samples: number;
+  malformed_metadata_lines: number;
+  orphan_wav_files: number;
   missing_wav_files: number;
   duplicate_transcripts: number;
   duplicate_audio_files: number;
+  duplicate_filenames: number;
   empty_transcripts: number;
   duration_warnings: number;
   sample_rate_mismatches: number;
+  channel_mismatches: number;
+  sample_width_mismatches: number;
   clipped_samples: number;
   high_silence_samples: number;
+  corrupt_audio_files: number;
 }
 
 export interface ValidationResult {
   valid: boolean;
+  ready_for_training?: boolean;
   error?: string;
   summary: ValidationSummary;
   samples: ValidationSampleItem[];
+  orphan_wavs?: string[];
 }
 
 export interface SystemStatus {
   ffmpegOk: boolean;
   ffmpegVersion: string;
   pythonVersion: string;
+  pythonCommand?: string | null;
   sampleAvailable: boolean;
   defaultOutputDir: string;
 }

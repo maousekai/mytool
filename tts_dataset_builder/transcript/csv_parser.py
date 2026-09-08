@@ -1,91 +1,78 @@
-"""
-CSV / TSV / Pipe-separated transcript parser for Vietnamese TTS Dataset Builder.
-"""
+"""CSV/TSV/semicolon/pipe transcript parser."""
 
 import csv
 import io
-from typing import List, Dict, Any
+import os
+from typing import Any, Dict, List
+
 from .cleaner import clean_vietnamese_text
 
 
-def parse_csv_transcript(file_path_or_content: str) -> List[Dict[str, Any]]:
-    """
-    Parses CSV transcript.
-    Auto-detects delimiter (, | \t ;)
-    Expected columns: start, end, text (in any order, or positional start, end, text).
-    """
-    if "\n" in file_path_or_content and not file_path_or_content.strip().endswith(".csv"):
-        f = io.StringIO(file_path_or_content)
-    else:
-        f = open(file_path_or_content, "r", encoding="utf-8-sig")
+def _open_source(value: str):
+    if os.path.isfile(value):
+        return open(value, "r", encoding="utf-8-sig", newline=""), True
+    return io.StringIO(value), False
 
+
+def _detect_delimiter(sample: str) -> str:
     try:
-        sample = f.read(2048)
-        f.seek(0)
-        # Sniff delimiter
-        delimiter = ","
-        for d in ["|", "\t", ";", ","]:
-            if d in sample:
-                delimiter = d
-                break
+        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;|")
+        return dialect.delimiter
+    except csv.Error:
+        # Prefer tab/semicolon/comma. Pipe is last because novel text can contain '|'.
+        counts = {d: sample.count(d) for d in ("\t", ";", ",", "|")}
+        return max(counts, key=counts.get) if max(counts.values(), default=0) else ","
 
-        reader = csv.reader(f, delimiter=delimiter)
-        rows = list(reader)
+
+def parse_csv_transcript(file_path_or_content: str) -> List[Dict[str, Any]]:
+    f, should_close = _open_source(file_path_or_content)
+    try:
+        sample = f.read(8192)
+        f.seek(0)
+        delimiter = _detect_delimiter(sample)
+        rows = list(csv.reader(f, delimiter=delimiter))
     finally:
-        if hasattr(f, "close") and not isinstance(f, io.StringIO):
+        if should_close:
             f.close()
 
     if not rows:
         return []
 
-    # Check header
-    first_row = [c.strip().lower() for c in rows[0]]
-    has_header = False
-    start_col, end_col, text_col = -1, -1, -1
+    first = [c.strip().casefold() for c in rows[0]]
+    aliases = {
+        "start": {"start", "start_time", "starttime", "start_sec", "begin", "from"},
+        "end": {"end", "end_time", "endtime", "end_sec", "to"},
+        "text": {"text", "transcript", "sentence", "content", "line"},
+    }
+    start_col = next((i for i, c in enumerate(first) if c in aliases["start"]), -1)
+    end_col = next((i for i, c in enumerate(first) if c in aliases["end"]), -1)
+    text_col = next((i for i, c in enumerate(first) if c in aliases["text"]), -1)
+    has_header = min(start_col, end_col, text_col) >= 0
 
-    for idx, col in enumerate(first_row):
-        if col in ("start", "start_time", "start_sec", "begin", "from"):
-            start_col = idx
-            has_header = True
-        elif col in ("end", "end_time", "end_sec", "to"):
-            end_col = idx
-            has_header = True
-        elif col in ("text", "transcript", "sentence", "content", "line"):
-            text_col = idx
-            has_header = True
-
-    # Fallback to positional: 0=start, 1=end, 2=text or 0=filename, 1=text
-    start_idx = 1 if has_header else 0
     if not has_header:
-        if len(rows[0]) >= 3:
-            start_col, end_col, text_col = 0, 1, 2
-        elif len(rows[0]) == 2:
-            # maybe metadata.csv format (filename|text)
+        if len(rows[0]) < 3:
             return []
+        start_col, end_col, text_col = 0, 1, 2
 
     results: List[Dict[str, Any]] = []
-    line_num = 0
-
-    for r in rows[start_idx:]:
-        if not r or len(r) <= max(start_col, end_col):
+    for row in rows[1 if has_header else 0:]:
+        if not row or max(start_col, end_col, text_col) >= len(row):
             continue
-
         try:
-            start_f = float(r[start_col].strip())
-            end_f = float(r[end_col].strip())
-            raw_text = r[text_col].strip() if text_col < len(r) else ""
-            cleaned_text = clean_vietnamese_text(raw_text)
-
-            line_num += 1
-            results.append({
-                "index": line_num,
-                "start": round(start_f, 3),
-                "end": round(end_f, 3),
-                "duration": round(end_f - start_f, 3),
-                "text": cleaned_text,
-            })
-        except (ValueError, IndexError):
+            start = float(row[start_col].strip().replace(",", ".") if delimiter != "," else row[start_col].strip())
+            end = float(row[end_col].strip().replace(",", ".") if delimiter != "," else row[end_col].strip())
+        except (TypeError, ValueError):
             continue
+        text = clean_vietnamese_text(row[text_col])
+        results.append({
+            "index": len(results) + 1,
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(end - start, 3),
+            "text": text,
+        })
 
-    results.sort(key=lambda x: x["start"])
+    results.sort(key=lambda x: (x["start"], x["end"]))
+    for i, item in enumerate(results, 1):
+        item["index"] = i
     return results

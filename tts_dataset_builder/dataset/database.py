@@ -1,12 +1,16 @@
 """
-SQLite Database manager for resume capability and state tracking.
-Ensures interrupted builds can resume without reprocessing existing samples.
+SQLite state manager for dataset build/resume.
+
+The database is intentionally kept inside each output dataset. It tracks the
+source-audio fingerprint, exact PCM cache and sample rate used by every sample
+so a manual regeneration can never silently cut from a different audiobook or
+at a different sampling rate.
 """
 
 import os
 import sqlite3
-from typing import Dict, Any, List, Optional
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
 class DatasetDatabase:
@@ -20,22 +24,29 @@ class DatasetDatabase:
         conn.row_factory = sqlite3.Row
         return conn
 
-    def _init_tables(self):
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+    def _init_tables(self) -> None:
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS samples (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sample_index INTEGER UNIQUE,
                     wav_filename TEXT UNIQUE,
                     text TEXT NOT NULL,
                     source_audio TEXT,
+                    source_key TEXT,
+                    source_pcm TEXT,
+                    sample_rate INTEGER,
                     start_time REAL,
                     end_time REAL,
                     actual_start REAL,
                     actual_end REAL,
                     duration REAL,
-                    status TEXT, -- 'accepted', 'rejected', 'pending'
+                    status TEXT,
                     rejection_reason TEXT,
                     quality_score REAL,
                     rms_db REAL,
@@ -44,108 +55,162 @@ class DatasetDatabase:
                     clipping_count INTEGER,
                     created_at TEXT
                 )
-            """)
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_source_time
-                ON samples(source_audio, start_time, end_time)
-            """)
+                """
+            )
+            columns = self._table_columns(conn, "samples")
+            for column, ddl in (("source_key", "TEXT"), ("source_pcm", "TEXT"), ("sample_rate", "INTEGER")):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE samples ADD COLUMN {column} {ddl}")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_source_time ON samples(source_audio, start_time, end_time)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_source_key_time ON samples(source_key, start_time, end_time)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sources (
+                    source_key TEXT PRIMARY KEY,
+                    source_audio TEXT NOT NULL,
+                    source_pcm TEXT NOT NULL,
+                    sample_rate INTEGER NOT NULL,
+                    build_signature TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            source_columns = self._table_columns(conn, "sources")
+            if "sample_rate" not in source_columns:
+                conn.execute("ALTER TABLE sources ADD COLUMN sample_rate INTEGER NOT NULL DEFAULT 24000")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sources_audio ON sources(source_audio)")
             conn.commit()
 
     def get_max_sample_index(self) -> int:
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT MAX(sample_index) FROM samples")
-            row = cursor.fetchone()
-            return row[0] if row and row[0] is not None else 0
+            row = conn.execute("SELECT MAX(sample_index) FROM samples").fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
 
-    def find_processed_sample(self, source_audio: str, start_time: float, end_time: float) -> Optional[Dict[str, Any]]:
+    def get_source_state(self, source_key: str) -> Optional[Dict[str, Any]]:
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT * FROM samples
-                WHERE source_audio = ?
-                  AND ABS(start_time - ?) < 0.05
-                  AND ABS(end_time - ?) < 0.05
-                LIMIT 1
-            """, (source_audio, start_time, end_time))
-            row = cursor.fetchone()
+            row = conn.execute("SELECT * FROM sources WHERE source_key = ?", (source_key,)).fetchone()
+            return dict(row) if row else None
+
+    def get_source_states_by_audio(self, source_audio: str) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM sources WHERE source_audio = ?", (source_audio,)).fetchall()]
+
+    def set_source_state(self, source_key: str, source_audio: str, source_pcm: str, sample_rate: int, build_signature: str) -> None:
+        now_str = datetime.now().isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO sources(source_key, source_audio, source_pcm, sample_rate, build_signature, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    source_audio = excluded.source_audio,
+                    source_pcm = excluded.source_pcm,
+                    sample_rate = excluded.sample_rate,
+                    build_signature = excluded.build_signature,
+                    updated_at = excluded.updated_at
+                """,
+                (source_key, source_audio, source_pcm, int(sample_rate), build_signature, now_str),
+            )
+            conn.commit()
+
+    def find_processed_sample(self, source_key: str, start_time: float, end_time: float, *, legacy_source_audio: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            row = conn.execute(
+                """SELECT * FROM samples WHERE source_key = ?
+                AND ABS(start_time - ?) < 0.05 AND ABS(end_time - ?) < 0.05 LIMIT 1""",
+                (source_key, start_time, end_time),
+            ).fetchone()
             if row:
                 return dict(row)
-            return None
+            if legacy_source_audio:
+                row = conn.execute(
+                    """SELECT * FROM samples WHERE (source_key IS NULL OR source_key = '')
+                    AND source_audio = ? AND ABS(start_time - ?) < 0.05
+                    AND ABS(end_time - ?) < 0.05 LIMIT 1""",
+                    (legacy_source_audio, start_time, end_time),
+                ).fetchone()
+                if row:
+                    return dict(row)
+        return None
+
+    def adopt_legacy_source(self, source_audio: str, source_key: str, source_pcm: str, sample_rate: int) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """UPDATE samples SET source_key = ?, source_pcm = ?, sample_rate = ?
+                WHERE source_audio = ? AND (source_key IS NULL OR source_key = '')""",
+                (source_key, source_pcm, int(sample_rate), source_audio),
+            )
+            conn.commit()
+
+    def get_samples_for_source(self, source_key: str) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            return [dict(r) for r in conn.execute("SELECT * FROM samples WHERE source_key = ? ORDER BY sample_index", (source_key,)).fetchall()]
+
+    def delete_samples_for_source(self, source_key: str, *, delete_source_state: bool = False) -> List[str]:
+        with self._get_connection() as conn:
+            rows = conn.execute("SELECT wav_filename FROM samples WHERE source_key = ?", (source_key,)).fetchall()
+            filenames = [str(row[0]) for row in rows if row[0]]
+            conn.execute("DELETE FROM samples WHERE source_key = ?", (source_key,))
+            if delete_source_state:
+                conn.execute("DELETE FROM sources WHERE source_key = ?", (source_key,))
+            conn.commit()
+            return filenames
 
     def upsert_sample(self, sample_data: Dict[str, Any]) -> int:
         now_str = datetime.now().isoformat()
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
+            cursor.execute(
+                """
                 INSERT INTO samples (
-                    sample_index, wav_filename, text, source_audio,
-                    start_time, end_time, actual_start, actual_end, duration,
-                    status, rejection_reason, quality_score, rms_db, peak_db,
-                    silence_ratio, clipping_count, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    sample_index, wav_filename, text, source_audio, source_key, source_pcm, sample_rate,
+                    start_time, end_time, actual_start, actual_end, duration, status, rejection_reason,
+                    quality_score, rms_db, peak_db, silence_ratio, clipping_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sample_index) DO UPDATE SET
-                    text = excluded.text,
-                    actual_start = excluded.actual_start,
-                    actual_end = excluded.actual_end,
-                    duration = excluded.duration,
-                    status = excluded.status,
-                    rejection_reason = excluded.rejection_reason,
-                    quality_score = excluded.quality_score,
-                    rms_db = excluded.rms_db,
-                    peak_db = excluded.peak_db,
-                    silence_ratio = excluded.silence_ratio,
-                    clipping_count = excluded.clipping_count,
-                    created_at = excluded.created_at
-            """, (
-                sample_data["sample_index"],
-                sample_data["wav_filename"],
-                sample_data["text"],
-                sample_data.get("source_audio", ""),
-                sample_data.get("start_time", 0.0),
-                sample_data.get("end_time", 0.0),
-                sample_data.get("actual_start", 0.0),
-                sample_data.get("actual_end", 0.0),
-                sample_data.get("duration", 0.0),
-                sample_data.get("status", "accepted"),
-                sample_data.get("rejection_reason", ""),
-                sample_data.get("quality_score", 100.0),
-                sample_data.get("rms_db", 0.0),
-                sample_data.get("peak_db", 0.0),
-                sample_data.get("silence_ratio", 0.0),
-                sample_data.get("clipping_count", 0),
-                now_str,
-            ))
+                    wav_filename=excluded.wav_filename, text=excluded.text, source_audio=excluded.source_audio,
+                    source_key=excluded.source_key, source_pcm=excluded.source_pcm, sample_rate=excluded.sample_rate,
+                    start_time=excluded.start_time, end_time=excluded.end_time, actual_start=excluded.actual_start,
+                    actual_end=excluded.actual_end, duration=excluded.duration, status=excluded.status,
+                    rejection_reason=excluded.rejection_reason, quality_score=excluded.quality_score,
+                    rms_db=excluded.rms_db, peak_db=excluded.peak_db, silence_ratio=excluded.silence_ratio,
+                    clipping_count=excluded.clipping_count, created_at=excluded.created_at
+                """,
+                (
+                    sample_data["sample_index"], sample_data["wav_filename"], sample_data["text"],
+                    sample_data.get("source_audio", ""), sample_data.get("source_key", ""),
+                    sample_data.get("source_pcm", ""), int(sample_data.get("sample_rate", 24000) or 24000),
+                    sample_data.get("start_time", 0.0), sample_data.get("end_time", 0.0),
+                    sample_data.get("actual_start", 0.0), sample_data.get("actual_end", 0.0),
+                    sample_data.get("duration", 0.0), sample_data.get("status", "accepted"),
+                    sample_data.get("rejection_reason", ""), sample_data.get("quality_score", 100.0),
+                    sample_data.get("rms_db", 0.0), sample_data.get("peak_db", 0.0),
+                    sample_data.get("silence_ratio", 0.0), sample_data.get("clipping_count", 0), now_str,
+                ),
+            )
             conn.commit()
-            return cursor.lastrowid or 0
+            return int(cursor.lastrowid or 0)
 
     def get_all_samples(self) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM samples ORDER BY sample_index ASC")
-            return [dict(r) for r in cursor.fetchall()]
+            return [dict(r) for r in conn.execute("SELECT * FROM samples ORDER BY sample_index ASC").fetchall()]
 
     def get_accepted_samples(self) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM samples WHERE status = 'accepted' ORDER BY sample_index ASC")
-            return [dict(r) for r in cursor.fetchall()]
+            return [dict(r) for r in conn.execute("SELECT * FROM samples WHERE status = 'accepted' ORDER BY sample_index ASC").fetchall()]
 
     def get_rejected_samples(self) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM samples WHERE status = 'rejected' ORDER BY sample_index ASC")
-            return [dict(r) for r in cursor.fetchall()]
+            return [dict(r) for r in conn.execute("SELECT * FROM samples WHERE status = 'rejected' ORDER BY sample_index ASC").fetchall()]
 
     def get_sample_by_filename(self, filename: str) -> Optional[Dict[str, Any]]:
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM samples WHERE wav_filename = ?", (filename,))
-            row = cursor.fetchone()
+            row = conn.execute("SELECT * FROM samples WHERE wav_filename = ?", (filename,)).fetchone()
             return dict(row) if row else None
 
-    def clear_all(self):
+    def clear_all(self) -> None:
         with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM samples")
+            conn.execute("DELETE FROM samples")
+            conn.execute("DELETE FROM sources")
             conn.commit()
