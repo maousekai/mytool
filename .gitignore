@@ -6,3 +6,21 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime/generated data
+uploads/
+output_dataset/
+.generated/
+logs/
+*.pcm
+*.db
+
+# Generated archives (sample fixtures already tracked remain unaffected)
+dataset.zip
