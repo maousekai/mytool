@@ -1,0 +1,33 @@
+{
+  "summary": {
+    "total_samples": 6,
+    "accepted_samples": 6,
+    "rejected_samples": 0,
+    "total_duration_seconds": 38.15,
+    "total_duration_formatted": "0m 38s",
+    "average_duration_seconds": 6.36,
+    "min_duration_seconds": 5.75,
+    "max_duration_seconds": 6.95
+  },
+  "duration_distribution": {
+    "0-2 sec": 0,
+    "2-4 sec": 0,
+    "4-6 sec": 2,
+    "6-8 sec": 4,
+    "8-10 sec": 0,
+    "10-12 sec": 0,
+    ">12 sec": 0
+  },
+  "parameters": {
+    "sample_rate": 24000,
+    "padding_before": 0.15,
+    "padding_after": 0.2,
+    "min_duration": 2.0,
+    "max_duration": 12.0,
+    "auto_merge_short": true,
+    "refine_vad": false,
+    "peak_norm": false,
+    "loudness_norm": false
+  },
+  "generated_at": "2026-09-08T15:21:39.744847"
+}

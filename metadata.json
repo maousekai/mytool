@@ -1,0 +1,6 @@
+{
+  "name": "Vietnamese TTS Dataset Builder",
+  "description": "Cắt và xử lý audio audiobook dài theo transcript căn thời gian thành dataset chuẩn fine-tune TTS tiếng Việt bằng Python và FFmpeg",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
